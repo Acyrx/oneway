@@ -4,8 +4,8 @@ import { useState, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Paperclip, Send, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import EmojiPicker from "../EmojiPicker";
-import GifPicker from "../GifPicker";
+import EmojiPicker from "@/components/EmojiPicker";
+import GifPicker from "@/components/GifPicker";
 import { Message, Profile } from "@/lib/types";
 
 interface MessageInputProps {
@@ -88,10 +88,10 @@ export function MessageInput({
     ? replyingTo.message_type === "gif"
       ? "GIF"
       : replyingTo.message_type === "file"
-        ? replyingTo.file_name || "File"
-        : replyingTo.message_type === "image"
-          ? "Photo"
-          : replyingTo.text?.trim() || "Message"
+      ? replyingTo.file_name || "File"
+      : replyingTo.message_type === "image"
+      ? "Photo"
+      : replyingTo.text?.trim() || "Message"
     : "";
 
   return (

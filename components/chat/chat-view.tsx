@@ -3,10 +3,10 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { ConversationList } from "./conversation-list";
-import { ChatHeader } from "./chat-header";
-import { MessageThread } from "./message-thread";
-import { MessageInput } from "./message-input";
+import { ConversationList } from "@/components/chat/conversation-list";
+import { ChatHeader } from "@/components/chat/chat-header";
+import { MessageThread } from "@/components/chat/message-thread";
+import { MessageInput } from "@/components/chat/message-input";
 import { MessageSquare } from "lucide-react";
 import {
   useUser,

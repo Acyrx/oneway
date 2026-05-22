@@ -20,9 +20,9 @@ import type {
 } from "@/lib/types";
 
 // ─── External sub-components (you provide these) ────────────────────────────
-import PollComponent from "./PollComponent";
-import TaskComponent from "./TaskComponent";
-import CalendarEventComponent from "./CalendarEventComponent";
+import PollComponent from "@/components/PollComponent";
+import TaskComponent from "@/components/chat/TaskComponent";
+import CalendarEventComponent from "@/components/CalendarEventComponent";
 import ReminderComponent from "@/components/ReminderComponent";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -285,7 +285,9 @@ function MessageBubble({
       <div
         className={cn(
           "rounded-2xl overflow-hidden max-w-[280px]",
-          isSent ? "bg-message-sent rounded-br-md" : "bg-message-received rounded-bl-md"
+          isSent
+            ? "bg-message-sent rounded-br-md"
+            : "bg-message-received rounded-bl-md"
         )}
       >
         {replyPreview}
@@ -308,12 +310,12 @@ function MessageBubble({
       <div>
         {replyPreview}
         {poll ? (
-      <PollComponent poll={poll} userId={currentUserId} />
-    ) : (
-      <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
-        {message.text || "Loading poll..."}
-      </div>
-    )}
+          <PollComponent poll={poll} userId={currentUserId} />
+        ) : (
+          <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
+            {message.text || "Loading poll..."}
+          </div>
+        )}
       </div>
     );
   }
@@ -324,16 +326,16 @@ function MessageBubble({
       <div>
         {replyPreview}
         {task ? (
-      <TaskComponent
-        task={task}
-        userId={currentUserId}
-        participants={participants}
-      />
-    ) : (
-      <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
-        Setting up task...
-      </div>
-    )}
+          <TaskComponent
+            task={task}
+            userId={currentUserId}
+            participants={participants}
+          />
+        ) : (
+          <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
+            Setting up task...
+          </div>
+        )}
       </div>
     );
   }
@@ -344,16 +346,16 @@ function MessageBubble({
       <div>
         {replyPreview}
         {event ? (
-      <CalendarEventComponent
-        event={event}
-        userId={currentUserId}
-        participants={participants}
-      />
-    ) : (
-      <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
-        Setting up event...
-      </div>
-    )}
+          <CalendarEventComponent
+            event={event}
+            userId={currentUserId}
+            participants={participants}
+          />
+        ) : (
+          <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
+            Setting up event...
+          </div>
+        )}
       </div>
     );
   }
@@ -364,12 +366,12 @@ function MessageBubble({
       <div>
         {replyPreview}
         {reminder ? (
-      <ReminderComponent reminder={reminder} userId={currentUserId} />
-    ) : (
-      <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
-        Setting up reminder...
-      </div>
-    )}
+          <ReminderComponent reminder={reminder} userId={currentUserId} />
+        ) : (
+          <div className="text-sm text-gray-500 italic p-2 bg-gray-50 dark:bg-gray-800 rounded">
+            Setting up reminder...
+          </div>
+        )}
       </div>
     );
   }
