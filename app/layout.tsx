@@ -29,6 +29,8 @@ export const metadata: Metadata = {
   },
 }
 
+import { ChatProvider } from '@/components/chat/chat-provider'
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -37,7 +39,9 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="font-sans antialiased">
-        {children}
+        <ChatProvider>
+          {children}
+        </ChatProvider>
         {process.env.NODE_ENV === 'production' && <Analytics />}
       </body>
     </html>

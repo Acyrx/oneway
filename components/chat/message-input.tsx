@@ -21,6 +21,8 @@ interface MessageInputProps {
   // To resolve the sender name in the reply preview
   currentUserId?: string;
   otherUser?: Profile | null;
+  isGroup?: boolean;
+  memberProfiles?: Profile[];
 }
 
 export function MessageInput({
@@ -33,6 +35,7 @@ export function MessageInput({
   onCancelReply,
   currentUserId,
   otherUser,
+  memberProfiles = [],
 }: MessageInputProps) {
   const [message, setMessage] = useState("");
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -77,11 +80,13 @@ export function MessageInput({
     setShowGifPicker(false);
   };
 
-  // Resolve the display name of whoever sent the message being replied to
   const replySenderName = replyingTo
     ? replyingTo.sender_id === currentUserId
       ? "You"
-      : otherUser?.display_name ?? "Unknown"
+      : memberProfiles.find((p) => p.id === replyingTo.sender_id)
+          ?.display_name ??
+        otherUser?.display_name ??
+        "Unknown"
     : null;
 
   const replyPreviewText = replyingTo

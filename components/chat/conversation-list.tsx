@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { Search, MessageSquarePlus, LogOut } from 'lucide-react'
+import { Search, MessageSquarePlus, LogOut, Users } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Input } from '@/components/ui/input'
@@ -11,6 +11,12 @@ import { useSearchUsers, useCreateConversation } from '@/hooks/use-chat'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { isToday, isYesterday, differenceInCalendarDays } from 'date-fns'
+import {
+  getConversationDisplayName,
+  getConversationInitials,
+  isGroupConversation,
+} from '@/lib/conversation-utils'
+import { CreateGroupDialog } from './create-group-dialog'
 
 interface ConversationListProps {
   conversations: ConversationWithDetails[]
@@ -18,7 +24,7 @@ interface ConversationListProps {
   onSelect: (id: string) => void
   isLoading?: boolean
   currentUserId: string | undefined
-  onConversationCreated: () => void
+  onConversationCreated: () => void | Promise<void>
 }
 
 function formatTime(dateString: string): string {
@@ -47,7 +53,11 @@ function ConversationItem({
   isSelected: boolean
   onClick: () => void
 }) {
-  const { other_user, last_message, unread_count } = conversation
+  const { last_message, unread_count } = conversation
+  const displayName = getConversationDisplayName(conversation)
+  const initials = getConversationInitials(conversation)
+  const isGroup = isGroupConversation(conversation)
+  const memberCount = conversation.members?.length ?? 0
 
   return (
     <button
@@ -59,11 +69,14 @@ function ConversationItem({
     >
       <div className="relative">
         <Avatar className="h-12 w-12">
-          <AvatarFallback className="bg-primary/20 text-primary font-medium">
-            {other_user.avatar_initials}
+          <AvatarFallback className={cn(
+            'font-medium',
+            isGroup ? 'bg-violet-500/20 text-violet-600 dark:text-violet-400' : 'bg-primary/20 text-primary'
+          )}>
+            {isGroup ? <Users className="h-5 w-5" /> : initials}
           </AvatarFallback>
         </Avatar>
-        {other_user.is_online && (
+        {!isGroup && conversation.other_user?.is_online && (
           <span className="absolute bottom-0 right-0 h-3.5 w-3.5 rounded-full border-2 border-card bg-online" />
         )}
       </div>
@@ -73,7 +86,7 @@ function ConversationItem({
             'font-medium truncate',
             unread_count > 0 ? 'text-foreground' : 'text-foreground'
           )}>
-            {other_user.display_name}
+            {displayName}
           </span>
           {last_message && (
             <span className="text-xs text-muted-foreground ml-2 flex-shrink-0">
@@ -86,7 +99,9 @@ function ConversationItem({
             'truncate text-sm',
             unread_count > 0 ? 'text-foreground font-medium' : 'text-muted-foreground'
           )}>
-            {last_message?.text || 'No messages yet'}
+            {isGroup && memberCount > 0 && !last_message
+              ? `${memberCount} members`
+              : last_message?.text || 'No messages yet'}
           </p>
           {unread_count > 0 && (
             <span className="ml-2 flex h-5 min-w-5 flex-shrink-0 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-medium text-primary-foreground">
@@ -123,7 +138,7 @@ function NewChatDialog({
 }: {
   currentUserId: string
   onClose: () => void
-  onConversationCreated: () => void
+  onConversationCreated: () => void | Promise<void>
   onSelectConversation: (id: string) => void
 }) {
   const [searchQuery, setSearchQuery] = useState('')
@@ -139,13 +154,19 @@ function NewChatDialog({
 
   const handleSelectUser = async (user: Profile) => {
     setCreating(true)
-    const conversation = await createConversation(currentUserId, user.id)
-    if (conversation) {
-      onConversationCreated()
-      onSelectConversation(conversation.id)
+    try {
+      const conversation = await createConversation(currentUserId, user.id)
+      if (conversation) {
+        // Await the refresh to ensure the new conversation is in the client-side list
+        await onConversationCreated()
+        onSelectConversation(conversation.id)
+      }
+    } catch (error) {
+      console.error('Failed to create or select conversation:', error)
+    } finally {
+      setCreating(false)
+      onClose()
     }
-    setCreating(false)
-    onClose()
   }
 
   return (
@@ -209,10 +230,11 @@ export function ConversationList({
 }: ConversationListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [showNewChat, setShowNewChat] = useState(false)
+  const [showNewGroup, setShowNewGroup] = useState(false)
   const router = useRouter()
 
   const filteredConversations = conversations.filter(conv =>
-    conv.other_user.display_name.toLowerCase().includes(searchQuery.toLowerCase())
+    getConversationDisplayName(conv).toLowerCase().includes(searchQuery.toLowerCase())
   )
 
   const handleLogout = async () => {
@@ -227,6 +249,15 @@ export function ConversationList({
       <div className="flex items-center justify-between border-b p-4">
         <h1 className="text-xl font-semibold text-foreground">Messages</h1>
         <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setShowNewGroup(true)}
+            className="text-muted-foreground hover:text-foreground"
+            title="New group"
+          >
+            <Users className="h-5 w-5" />
+          </Button>
           <Button
             variant="ghost"
             size="icon"
@@ -307,6 +338,16 @@ export function ConversationList({
           onClose={() => setShowNewChat(false)}
           onConversationCreated={onConversationCreated}
           onSelectConversation={onSelect}
+        />
+      )}
+      {showNewGroup && currentUserId && (
+        <CreateGroupDialog
+          currentUserId={currentUserId}
+          onClose={() => setShowNewGroup(false)}
+          onCreated={(id) => {
+            onConversationCreated()
+            onSelect(id)
+          }}
         />
       )}
     </div>

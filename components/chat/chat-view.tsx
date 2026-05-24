@@ -14,12 +14,18 @@ import {
   useMessages,
   useSendMessage,
   useSendGif,
+  useOnlinePresence,
 } from "@/hooks/use-chat";
 import { createClient } from "@/lib/supabase/client";
 import CreatePollModal from "../CreatePollModal";
 import CreateTaskModal from "../CreateTaskModal";
 import CreateCalendarEventModal from "../CreateCalendarEventModal";
 import CreateReminderModal from "../CreateReminderModal";
+import { GroupInfoPanel } from "./group-info-panel";
+import {
+  getMemberProfiles,
+  isGroupConversation,
+} from "@/lib/conversation-utils";
 import type {
   Message,
   Profile,
@@ -60,11 +66,38 @@ export function ChatView() {
   } = useMessages(selectedConversationId, user?.id);
   const { sendMessage, sending } = useSendMessage();
   const { sendGif } = useSendGif();
+  const onlineUserIds = useOnlinePresence(user?.id);
+
+  // ── Enriched data with real-time presence ──────────────────────────────────
+  const enrichedConversations = conversations.map((conv) => {
+    const members = conv.members?.map((m) => ({
+      ...m,
+      profile: {
+        ...m.profile,
+        is_online: onlineUserIds.has(m.user_id),
+      },
+    }));
+
+    let other_user = conv.other_user;
+    if (other_user) {
+      other_user = {
+        ...other_user,
+        is_online: onlineUserIds.has(other_user.id),
+      };
+    }
+
+    return { ...conv, members, other_user };
+  });
+
+  const selectedConversation = enrichedConversations.find(
+    (c) => c.id === selectedConversationId
+  );
 
   // ── UI state ───────────────────────────────────────────────────────────────
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [productivityModal, setProductivityModal] =
     useState<ProductivityModal | null>(null);
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
 
   // ── Productivity data keyed by message.id ─────────────────────────────────
   const [polls, setPolls] = useState<Record<string, Poll>>({});
@@ -320,20 +353,30 @@ export function ChatView() {
   }, [selectedConversationId]);
 
   // ── Derived ────────────────────────────────────────────────────────────────
-  const selectedConversation = conversations.find(
-    (c) => c.id === selectedConversationId
-  );
   const otherUser: Profile | null = selectedConversation?.other_user ?? null;
+  const isGroup = selectedConversation
+    ? isGroupConversation(selectedConversation)
+    : false;
+  const canShowChat =
+    selectedConversationId &&
+    (isGroup || otherUser);
+  const chatParticipants: Profile[] = selectedConversation
+    ? getMemberProfiles(selectedConversation).filter((p) => p.id !== user?.id)
+    : otherUser
+      ? [otherUser]
+      : [];
 
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleSelectConversation = (id: string) => {
     setSelectedConversationId(id);
     setReplyingTo(null);
+    setShowGroupInfo(false);
   };
 
   const handleBackToList = () => {
     setSelectedConversationId(null);
     setReplyingTo(null);
+    setShowGroupInfo(false);
   };
 
   const handleSendMessage = async (text: string) => {
@@ -345,7 +388,6 @@ export function ChatView() {
       replyingTo?.id ?? null
     );
     setReplyingTo(null);
-    await refetchMessages();
     refetch();
   };
 
@@ -393,7 +435,6 @@ export function ChatView() {
     }
 
     setProductivityModal({ type, messageId: msg.id });
-    await refetchMessages();
     refetch();
   };
 
@@ -419,7 +460,6 @@ export function ChatView() {
       return;
     }
 
-    await refetchMessages();
     refetch();
   };
 
@@ -473,7 +513,6 @@ export function ChatView() {
       }
     }
 
-    await refetchMessages();
     refetch();
   };
 
@@ -488,8 +527,7 @@ export function ChatView() {
 
   if (!user) return null;
 
-  // Participants list for modals (both users in the conversation)
-  const participants: Profile[] = otherUser ? [otherUser] : [];
+  const participants: Profile[] = chatParticipants;
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -502,7 +540,7 @@ export function ChatView() {
         )}
       >
         <ConversationList
-          conversations={conversations}
+          conversations={enrichedConversations}
           selectedId={selectedConversationId}
           onSelect={handleSelectConversation}
           isLoading={convsLoading}
@@ -518,22 +556,29 @@ export function ChatView() {
           !selectedConversationId ? "hidden md:flex" : "flex"
         )}
       >
-        {selectedConversationId && otherUser ? (
+        {canShowChat && selectedConversation ? (
           <>
             <ChatHeader
+              conversation={selectedConversation}
               user={otherUser}
               onBack={handleBackToList}
               showBackButton={true}
+              onOpenGroupInfo={() => setShowGroupInfo(true)}
             />
             <MessageThread
               messages={messages}
               currentUserId={user.id}
               otherUser={otherUser}
+              isGroup={isGroup}
+              memberProfiles={
+                selectedConversation.members?.map((m) => m.profile) ?? []
+              }
               isLoading={messagesLoading}
               polls={polls}
               tasks={tasks}
               calendarEvents={calendarEvents}
               reminders={reminders}
+              participants={participants}
               onDeleteMessage={handleDeleteMessage}
               onReplyTo={setReplyingTo}
               onOpenThread={handleOpenThread}
@@ -546,8 +591,24 @@ export function ChatView() {
               onCancelReply={() => setReplyingTo(null)}
               currentUserId={user.id}
               otherUser={otherUser}
+              memberProfiles={
+                selectedConversation.members?.map((m) => m.profile) ?? []
+              }
+              isGroup={isGroup}
               onCreateProductivity={handleCreateProductivity}
             />
+            {showGroupInfo && isGroup && (
+              <GroupInfoPanel
+                conversation={selectedConversation}
+                currentUserId={user.id}
+                onClose={() => setShowGroupInfo(false)}
+                onUpdated={refetch}
+                onLeftGroup={() => {
+                  setSelectedConversationId(null);
+                  refetch();
+                }}
+              />
+            )}
           </>
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center bg-secondary/30">

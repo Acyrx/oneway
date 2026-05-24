@@ -7,12 +7,30 @@ export type Profile = {
   updated_at: string;
 };
 
+export type ConversationType = "direct" | "group";
+export type ConversationMemberRole = "admin" | "member";
+
 export type Conversation = {
   id: string;
-  participant_1: string;
-  participant_2: string;
+  participant_1: string | null;
+  participant_2: string | null;
+  type?: ConversationType;
+  name?: string | null;
+  created_by?: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type ConversationMember = {
+  id: string;
+  conversation_id: string;
+  user_id: string;
+  role: ConversationMemberRole;
+  joined_at: string;
+};
+
+export type ConversationMemberWithProfile = ConversationMember & {
+  profile: Profile;
 };
 
 export interface Message {
@@ -42,7 +60,9 @@ export interface Message {
 }
 
 export type ConversationWithDetails = Conversation & {
-  other_user: Profile;
+  other_user?: Profile | null;
+  members?: ConversationMemberWithProfile[];
+  my_role?: ConversationMemberRole;
   last_message: Message | null;
   unread_count: number;
 };
@@ -116,9 +136,9 @@ export interface Task {
 }
 
 export interface Reminder {
-  conversation_id(conversation_id: any): void;
   id: string;
-  chat_id: string;
+  conversation_id: string;
+  chat_id?: string;
   message_id: string | null;
   created_by: string;
   user_id: string;

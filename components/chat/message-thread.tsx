@@ -31,14 +31,14 @@ interface MessageThreadProps {
   messages: Message[];
   currentUserId: string;
   otherUser: Profile | null;
+  isGroup?: boolean;
+  memberProfiles?: Profile[];
   isLoading?: boolean;
-  // Productivity data keyed by message.id
   polls?: Record<string, Poll>;
   tasks?: Record<string, Task>;
   calendarEvents?: Record<string, CalendarEvent>;
   reminders?: Record<string, Reminder>;
   participants?: Profile[];
-  // Callbacks
   onDeleteMessage?: (messageId: string) => Promise<void>;
   onReplyTo?: (message: Message) => void;
   onOpenThread?: (message: Message) => void;
@@ -96,10 +96,14 @@ function getReplyPreviewText(
 function getReplySenderName(
   repliedTo: NonNullable<Message["replied_to_message"]>,
   currentUserId: string,
-  otherUser: Profile | null
+  otherUser: Profile | null,
+  profileById: Map<string, Profile>
 ): string {
   const senderId = repliedTo.sender?.id;
   if (senderId === currentUserId) return "You";
+  if (senderId && profileById.has(senderId)) {
+    return profileById.get(senderId)!.display_name;
+  }
   return repliedTo.sender?.display_name ?? otherUser?.display_name ?? "Unknown";
 }
 
@@ -184,12 +188,14 @@ function ReplyPreview({
   isSent,
   currentUserId,
   otherUser,
+  profileById,
   onJumpToMessage,
 }: {
   repliedTo: NonNullable<Message["replied_to_message"]>;
   isSent: boolean;
   currentUserId: string;
   otherUser: Profile | null;
+  profileById: Map<string, Profile>;
   onJumpToMessage: (messageId: string) => void;
 }) {
   return (
@@ -210,7 +216,7 @@ function ReplyPreview({
           isSent ? "text-emerald-100" : "text-primary"
         )}
       >
-        {getReplySenderName(repliedTo, currentUserId, otherUser)}
+        {getReplySenderName(repliedTo, currentUserId, otherUser, profileById)}
       </p>
       <p
         className={cn(
@@ -247,6 +253,7 @@ interface BubbleProps {
   isSent: boolean;
   currentUserId: string;
   otherUser: Profile | null;
+  profileById: Map<string, Profile>;
   onJumpToMessage: (messageId: string) => void;
   polls?: Record<string, Poll>;
   tasks?: Record<string, Task>;
@@ -260,6 +267,7 @@ function MessageBubble({
   isSent,
   currentUserId,
   otherUser,
+  profileById,
   onJumpToMessage,
   polls = {},
   tasks = {},
@@ -275,6 +283,7 @@ function MessageBubble({
       isSent={isSent}
       currentUserId={currentUserId}
       otherUser={otherUser}
+      profileById={profileById}
       onJumpToMessage={onJumpToMessage}
     />
   ) : null;
@@ -432,6 +441,8 @@ export function MessageThread({
   messages,
   currentUserId,
   otherUser,
+  isGroup = false,
+  memberProfiles = [],
   isLoading = false,
   polls = {},
   tasks = {},
@@ -442,6 +453,12 @@ export function MessageThread({
   onReplyTo,
   onOpenThread,
 }: MessageThreadProps) {
+  const profileById = useMemo(() => {
+    const map = new Map<string, Profile>();
+    memberProfiles.forEach((p) => map.set(p.id, p));
+    if (otherUser) map.set(otherUser.id, otherUser);
+    return map;
+  }, [memberProfiles, otherUser]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [deletingMessageId, setDeletingMessageId] = useState<string | null>(
     null
@@ -489,12 +506,13 @@ export function MessageThread({
             display_name:
               parent.sender_id === currentUserId
                 ? "You"
-                : otherUser?.display_name,
+                : profileById.get(parent.sender_id)?.display_name ??
+                  otherUser?.display_name,
           },
         },
       };
     });
-  }, [messages, currentUserId, otherUser]);
+  }, [messages, currentUserId, otherUser, profileById]);
 
   if (isLoading) return <MessageThreadSkeleton />;
   if (displayMessages.length === 0) return <EmptyChat otherUser={otherUser} />;
@@ -533,6 +551,11 @@ export function MessageThread({
                 const showAvatar =
                   !isSent &&
                   (!prevMessage || prevMessage.sender_id !== message.sender_id);
+                const showSenderName =
+                  isGroup &&
+                  !isSent &&
+                  showAvatar;
+                const senderProfile = profileById.get(message.sender_id);
                 const replyCount = replyCounts[message.id] ?? 0;
 
                 return (
@@ -549,10 +572,10 @@ export function MessageThread({
                     {/* Avatar */}
                     {!isSent && (
                       <div className="w-8 flex-shrink-0">
-                        {showAvatar && otherUser && (
+                        {showAvatar && (senderProfile || otherUser) && (
                           <Avatar className="h-8 w-8">
                             <AvatarFallback className="bg-primary/20 text-primary text-xs font-medium">
-                              {otherUser.avatar_initials}
+                              {(senderProfile ?? otherUser)!.avatar_initials}
                             </AvatarFallback>
                           </Avatar>
                         )}
@@ -565,6 +588,11 @@ export function MessageThread({
                         isSent ? "items-end" : "items-start"
                       )}
                     >
+                      {showSenderName && senderProfile && (
+                        <p className="text-xs font-medium text-primary px-1 mb-0.5">
+                          {senderProfile.display_name}
+                        </p>
+                      )}
                       {/* Bubble + hover actions */}
                       <div className="relative group">
                         <MessageBubble
@@ -572,6 +600,7 @@ export function MessageThread({
                           isSent={isSent}
                           currentUserId={currentUserId}
                           otherUser={otherUser}
+                          profileById={profileById}
                           onJumpToMessage={scrollToMessage}
                           polls={polls}
                           tasks={tasks}
