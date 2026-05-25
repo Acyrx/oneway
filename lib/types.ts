@@ -3,6 +3,8 @@ export type Profile = {
   display_name: string;
   avatar_initials: string;
   is_online: boolean;
+  presence_status?: string;
+  public_key?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -17,6 +19,7 @@ export type Conversation = {
   type?: ConversationType;
   name?: string | null;
   created_by?: string | null;
+  disappear_after?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -39,12 +42,14 @@ export interface Message {
   sender_id: string;
   text: string;
   status: "sending" | "sent" | "delivered" | "read";
-  message_type?: "text" | "gif" | "file" | "image";
+  message_type?: "text" | "gif" | "file" | "image" | "poll" | "task" | "calendar_event" | "reminder" | "voice_note";
   file_url?: string;
   file_name?: string;
   file_size?: number;
   file_type?: string;
   reply_to?: string | null;
+  edited_at?: string | null;
+  expires_at?: string | null;
   replied_to_message?: {
     id: string;
     text: string;
@@ -57,6 +62,23 @@ export interface Message {
     };
   } | null;
   created_at: string;
+}
+
+export type PresenceStatus = "online" | "away" | "busy" | "sleepy" | "vibing" | "brb";
+
+export interface UserPresenceInfo {
+  isOnline: boolean;
+  status: PresenceStatus;
+}
+
+export interface PinnedMessage {
+  id: string;
+  conversation_id: string;
+  message_id: string;
+  pinned_by: string;
+  pinned_at: string;
+  message_text?: string | null;
+  message_type?: string | null;
 }
 
 export type ConversationWithDetails = Conversation & {
@@ -175,15 +197,34 @@ export interface ReplySuggestion {
   explanation?: string;
 }
 
+export interface ChatFolder {
+  id: string;
+  user_id: string;
+  name: string;
+  emoji: string | null;
+  color: string | null;
+  position: number;
+  created_at: string;
+  conversationIds: Set<string>;
+}
+
 export interface Status {
   id: string;
   user_id: string;
-  media_url: string;
-  media_type: "image" | "video";
+  type: 'text' | 'image' | 'video' | 'audio';
+  content: string | null;
   caption: string | null;
+  bg_color: string | null;
+  text_color: string | null;
+  duration: number;
+  file_size: number | null;
   expires_at: string;
   created_at: string;
-  user?: Profile;
-  view_count?: number;
-  has_viewed?: boolean;
+}
+
+export interface StatusGroup {
+  user_id: string;
+  profile: Profile;
+  statuses: Status[];
+  unviewed_count: number;
 }

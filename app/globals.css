@@ -133,7 +133,58 @@
   * {
     @apply border-border outline-ring/50;
   }
-  body {
+  html, body {
     @apply bg-background text-foreground;
+    height: 100%;
+    overscroll-behavior: none;
   }
 }
+
+/* ── Mobile / safe-area utilities ── */
+.h-dvh   { height: 100dvh; }
+.min-h-dvh { min-height: 100dvh; }
+
+/* Safe-area padding for iPhone home indicator */
+.pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+.pt-safe { padding-top:    env(safe-area-inset-top,    0px); }
+
+/* Touch-friendly momentum scrolling on iOS */
+.scroll-touch { -webkit-overflow-scrolling: touch; }
+
+/* Prevent text selection on interactive elements for touch */
+.no-select { user-select: none; -webkit-user-select: none; }
+
+/* Smooth scrollbar hiding for horizontal tabs */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar { display: none; }
+
+/* Message bubble max-width responsive */
+@media (max-width: 480px) {
+  .message-bubble { max-width: 88vw; }
+}
+@media (min-width: 481px) {
+  .message-bubble { max-width: 70%; }
+}
+
+/* Ensure tap targets are at least 44px on mobile */
+@media (max-width: 768px) {
+  button, [role="button"] { min-height: 44px; }
+  input, textarea { font-size: 16px; } /* prevent iOS auto-zoom */
+}
+
+/* Status dot pulse animation */
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+.status-pulse { animation: status-pulse 2s ease-in-out infinite; }
+
+/* Disappearing message timer countdown */
+@keyframes timer-shrink {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: 44; }
+}
+.timer-ring { animation: timer-shrink linear forwards; }

@@ -3,8 +3,9 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useChatCache } from "@/components/chat/chat-provider";
-import type { Profile, Conversation, Message, ConversationWithDetails, ConversationMemberWithProfile, ConversationMemberRole } from "@/lib/types";
-import type { User, RealtimeChannel, RealtimePresenceState } from "@supabase/supabase-js";
+import type { Profile, Conversation, Message, ConversationWithDetails, ConversationMemberWithProfile, ConversationMemberRole, PresenceStatus, UserPresenceInfo, PinnedMessage, ChatFolder } from "@/lib/types";
+import type { User, RealtimeChannel } from "@supabase/supabase-js";
+import { getOrCreateKeyPair, encryptText, decryptText, isEncryptedPayload } from "@/lib/encryption";
 
 export const MESSAGE_SELECT = `
   *,
@@ -214,9 +215,39 @@ export function useConversations(userId: string | undefined) {
 
   useEffect(() => {
     fetchConversations();
+
+    const supabase = createClient();
+    // Listen for changes in conversations or messages to update the list and unread counts
+    const channel = supabase
+      .channel('conversations-realtime')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'messages' },
+        () => {
+          fetchConversations();
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'conversations' },
+        () => {
+          fetchConversations();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [fetchConversations]);
 
-  return { conversations, loading, refetch: fetchConversations };
+  const markConversationRead = useCallback((conversationId: string) => {
+    setConversations(prev =>
+      prev.map(c => c.id === conversationId ? { ...c, unread_count: 0 } : c)
+    );
+  }, []);
+
+  return { conversations, loading, refetch: fetchConversations, markConversationRead };
 }
 
 export function useMessages(
@@ -375,7 +406,8 @@ export function useSendMessage() {
       conversationId: string,
       senderId: string,
       text: string,
-      replyTo?: string | null
+      replyTo?: string | null,
+      expiresAt?: string | null
     ): Promise<Message | null> => {
       setSending(true);
       const supabase = createClient();
@@ -388,6 +420,7 @@ export function useSendMessage() {
           text: text.trim(),
           reply_to: replyTo ?? null,
           status: "sent",
+          expires_at: expiresAt ?? null,
         })
         .select(MESSAGE_SELECT)
         .single();
@@ -398,6 +431,12 @@ export function useSendMessage() {
         console.error("Error sending message:", error);
         return null;
       }
+
+      // Update conversation's updated_at
+      await supabase
+        .from("conversations")
+        .update({ updated_at: new Date().toISOString() })
+        .eq("id", conversationId);
 
       return data;
     },
@@ -660,7 +699,8 @@ export function useSendGif() {
     async (
       conversationId: string,
       senderId: string,
-      gifUrl: string
+      gifUrl: string,
+      expiresAt?: string | null
     ): Promise<Message | null> => {
       setSending(true);
       const supabase = createClient();
@@ -677,6 +717,7 @@ export function useSendGif() {
           file_size: 0,
           file_type: "image/gif",
           status: "sent",
+          expires_at: expiresAt ?? null,
         })
         .select()
         .single();
@@ -711,22 +752,15 @@ export function useOnlinePresence(userId: string | undefined) {
     }
 
     const supabase = createClient();
-    // Use a single channel for all online status tracking
     const channel = supabase.channel('online-users', {
-      config: {
-        presence: {
-          key: userId,
-        },
-      },
+      config: { presence: { key: userId } },
     });
 
     channel
       .on('presence', { event: 'sync' }, () => {
         const state = channel.presenceState();
         const ids = new Set<string>();
-        Object.keys(state).forEach((key) => {
-          ids.add(key);
-        });
+        Object.keys(state).forEach((key) => ids.add(key));
         setOnlineUserIds(ids);
       })
       .on('presence', { event: 'join' }, ({ key }) => {
@@ -741,17 +775,727 @@ export function useOnlinePresence(userId: string | undefined) {
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
-          await channel.track({
-            user_id: userId,
-            online_at: new Date().toISOString(),
-          });
+          await channel.track({ user_id: userId, online_at: new Date().toISOString() });
         }
       });
 
+    return () => { supabase.removeChannel(channel); };
+  }, [userId]);
+
+  return onlineUserIds;
+}
+
+export function usePresenceWithStatus(userId: string | undefined) {
+  const [presenceMap, setPresenceMap] = useState<Map<string, UserPresenceInfo>>(new Map());
+  const [myStatus, setMyStatus] = useState<PresenceStatus>('online');
+  const channelRef = useRef<RealtimeChannel | null>(null);
+
+  useEffect(() => {
+    if (!userId) return;
+    const supabase = createClient();
+    const channel = supabase.channel('user-presence', {
+      config: { presence: { key: userId } },
+    });
+    channelRef.current = channel;
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState<{ user_id: string; status: PresenceStatus }>();
+        const map = new Map<string, UserPresenceInfo>();
+        Object.entries(state).forEach(([key, presences]) => {
+          const p = (presences as unknown[])[0] as { status?: PresenceStatus };
+          map.set(key, { isOnline: true, status: p?.status ?? 'online' });
+        });
+        setPresenceMap(map);
+      })
+      .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+        const p = (newPresences as unknown[])[0] as { status?: PresenceStatus };
+        setPresenceMap(prev => {
+          const next = new Map(prev);
+          next.set(key, { isOnline: true, status: p?.status ?? 'online' });
+          return next;
+        });
+      })
+      .on('presence', { event: 'leave' }, ({ key }) => {
+        setPresenceMap(prev => {
+          const next = new Map(prev);
+          next.delete(key);
+          return next;
+        });
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          await channel.track({ user_id: userId, status: 'online' });
+          const sb = createClient();
+          await sb.from('profiles').update({ is_online: true, presence_status: 'online' }).eq('id', userId);
+        }
+      });
+
+    const handleUnload = () => {
+      createClient().from('profiles').update({ is_online: false }).eq('id', userId);
+    };
+    window.addEventListener('beforeunload', handleUnload);
+
     return () => {
+      window.removeEventListener('beforeunload', handleUnload);
+      createClient().from('profiles').update({ is_online: false }).eq('id', userId);
+      channelRef.current = null;
       supabase.removeChannel(channel);
     };
   }, [userId]);
 
-  return onlineUserIds;
+  const updateStatus = useCallback(async (status: PresenceStatus) => {
+    setMyStatus(status);
+    if (channelRef.current && userId) {
+      await channelRef.current.track({ user_id: userId, status });
+    }
+    const sb = createClient();
+    await sb.from('profiles').update({ presence_status: status }).eq('id', userId);
+  }, [userId]);
+
+  return { presenceMap, myStatus, updateStatus };
+}
+
+export function useTypingIndicator(
+  conversationId: string | null,
+  userId: string | undefined,
+  displayName: string | undefined
+) {
+  const [typingUsers, setTypingUsers] = useState<Map<string, string>>(new Map());
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const timeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(() => {
+    if (!conversationId || !userId) return;
+    const supabase = createClient();
+    const channel = supabase.channel(`typing:${conversationId}`);
+    channelRef.current = channel;
+
+    channel
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        if (payload.user_id === userId) return;
+        setTypingUsers(prev => {
+          const next = new Map(prev);
+          next.set(payload.user_id, payload.display_name);
+          return next;
+        });
+        const existing = timeoutsRef.current.get(payload.user_id);
+        if (existing) clearTimeout(existing);
+        const t = setTimeout(() => {
+          setTypingUsers(prev => {
+            const next = new Map(prev);
+            next.delete(payload.user_id);
+            return next;
+          });
+          timeoutsRef.current.delete(payload.user_id);
+        }, 3000);
+        timeoutsRef.current.set(payload.user_id, t);
+      })
+      .subscribe();
+
+    return () => {
+      channelRef.current = null;
+      timeoutsRef.current.forEach(t => clearTimeout(t));
+      timeoutsRef.current.clear();
+      supabase.removeChannel(channel);
+    };
+  }, [conversationId, userId]);
+
+  const sendTyping = useCallback(() => {
+    if (!channelRef.current || !userId || !displayName) return;
+    channelRef.current.send({
+      type: 'broadcast',
+      event: 'typing',
+      payload: { user_id: userId, display_name: displayName },
+    });
+  }, [userId, displayName]);
+
+  return { typingUsers, sendTyping };
+}
+
+export function useEditMessage() {
+  const editMessage = useCallback(async (messageId: string, newText: string): Promise<boolean> => {
+    const supabase = createClient();
+    const { error } = await supabase
+      .from('messages')
+      .update({ text: newText.trim(), edited_at: new Date().toISOString() })
+      .eq('id', messageId);
+    if (error) {
+      const { error: e2 } = await supabase
+        .from('messages')
+        .update({ text: newText.trim() })
+        .eq('id', messageId);
+      return !e2;
+    }
+    return true;
+  }, []);
+
+  return { editMessage };
+}
+
+export function usePinnedMessages(conversationId: string | null) {
+  const [pinnedMessages, setPinnedMessages] = useState<PinnedMessage[]>([]);
+
+  const fetchPinned = useCallback(async () => {
+    if (!conversationId) return;
+    const supabase = createClient();
+    try {
+      const { data } = await supabase
+        .from('pinned_messages')
+        .select('*')
+        .eq('conversation_id', conversationId)
+        .order('pinned_at', { ascending: false });
+      setPinnedMessages(data ?? []);
+    } catch {
+      setPinnedMessages([]);
+    }
+  }, [conversationId]);
+
+  useEffect(() => { fetchPinned(); }, [fetchPinned]);
+
+  const pinMessage = useCallback(async (message: Message, pinnedBy: string): Promise<boolean> => {
+    if (!conversationId) return false;
+    const supabase = createClient();
+    try {
+      const { error } = await supabase.from('pinned_messages').insert({
+        conversation_id: conversationId,
+        message_id: message.id,
+        pinned_by: pinnedBy,
+        message_text: message.text,
+        message_type: message.message_type ?? 'text',
+      });
+      if (!error) { await fetchPinned(); return true; }
+    } catch { /* pinned_messages table may not exist yet */ }
+    return false;
+  }, [conversationId, fetchPinned]);
+
+  const unpinMessage = useCallback(async (messageId: string): Promise<boolean> => {
+    if (!conversationId) return false;
+    const supabase = createClient();
+    try {
+      const { error } = await supabase
+        .from('pinned_messages')
+        .delete()
+        .eq('conversation_id', conversationId)
+        .eq('message_id', messageId);
+      if (!error) { await fetchPinned(); return true; }
+    } catch { /* pinned_messages table may not exist yet */ }
+    return false;
+  }, [conversationId, fetchPinned]);
+
+  return { pinnedMessages, pinMessage, unpinMessage, refetchPinned: fetchPinned };
+}
+
+export function useFileUpload() {
+  const [uploading, setUploading] = useState(false);
+
+  const uploadFile = useCallback(async (
+    conversationId: string,
+    senderId: string,
+    file: File,
+    expiresAt?: string | null
+  ): Promise<Message | null> => {
+    setUploading(true);
+    const supabase = createClient();
+    const ext = file.name.split('.').pop() ?? 'bin';
+    const path = `${conversationId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('chat-files')
+      .upload(path, file, { cacheControl: '3600', upsert: false });
+
+    if (uploadError) {
+      console.error('Upload error:', uploadError);
+      setUploading(false);
+      return null;
+    }
+
+    const { data: { publicUrl } } = supabase.storage.from('chat-files').getPublicUrl(uploadData.path);
+    const isImage = file.type.startsWith('image/');
+
+    const { data, error } = await supabase.from('messages').insert({
+      conversation_id: conversationId,
+      sender_id: senderId,
+      text: isImage ? 'Photo' : file.name,
+      message_type: isImage ? 'image' : 'file',
+      file_url: publicUrl,
+      file_name: file.name,
+      file_size: file.size,
+      file_type: file.type,
+      status: 'sent',
+      expires_at: expiresAt ?? null,
+    }).select(MESSAGE_SELECT).single();
+
+    setUploading(false);
+    if (error) { console.error('Message error:', error); return null; }
+
+    await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId);
+    return data;
+  }, []);
+
+  return { uploadFile, uploading };
+}
+
+export function useSendVoiceNote() {
+  const [uploading, setUploading] = useState(false);
+
+  const sendVoiceNote = useCallback(async (
+    conversationId: string,
+    senderId: string,
+    audioBlob: Blob,
+    durationSeconds: number,
+    expiresAt?: string | null
+  ): Promise<Message | null> => {
+    setUploading(true);
+    const supabase = createClient();
+
+    // Determine extension from the blob's actual MIME type
+    const mimeType = audioBlob.type || 'audio/webm';
+    const ext = mimeType.includes('ogg') ? 'ogg'
+      : mimeType.includes('mp4') ? 'mp4'
+      : 'webm';
+    const path = `${conversationId}/voice-${Date.now()}.${ext}`;
+
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('chat-files')
+      .upload(path, audioBlob, { contentType: mimeType, cacheControl: '3600', upsert: false });
+
+    if (uploadError) {
+      console.error('Voice upload error:', uploadError);
+      setUploading(false);
+      return null;
+    }
+
+    const { data: { publicUrl } } = supabase.storage.from('chat-files').getPublicUrl(uploadData.path);
+    const mins = Math.floor(durationSeconds / 60);
+    const secs = (durationSeconds % 60).toString().padStart(2, '0');
+
+    const { data, error } = await supabase.from('messages').insert({
+      conversation_id: conversationId,
+      sender_id: senderId,
+      text: `Voice note (${mins}:${secs})`,
+      message_type: 'voice_note',
+      file_url: publicUrl,
+      file_name: `voice-note.${ext}`,
+      file_size: audioBlob.size,
+      file_type: mimeType,
+      status: 'sent',
+      expires_at: expiresAt ?? null,
+    }).select(MESSAGE_SELECT).single();
+
+    setUploading(false);
+    if (error) { console.error('Voice message error:', error); return null; }
+
+    await supabase.from('conversations').update({ updated_at: new Date().toISOString() }).eq('id', conversationId);
+    return data;
+  }, []);
+
+  return { sendVoiceNote, uploading };
+}
+
+export function useBlockedUsers(userId: string | undefined) {
+  const [blockedIds, setBlockedIds] = useState<Set<string>>(new Set());
+
+  const fetchBlocked = useCallback(async () => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      const { data } = await supabase.from('blocked_users').select('blocked_id').eq('blocker_id', userId);
+      setBlockedIds(new Set(data?.map(r => r.blocked_id) ?? []));
+    } catch { /* table may not exist */ }
+  }, [userId]);
+
+  useEffect(() => { fetchBlocked(); }, [fetchBlocked]);
+
+  const blockUser = useCallback(async (targetId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('blocked_users').insert({ blocker_id: userId, blocked_id: targetId });
+      setBlockedIds(prev => new Set([...prev, targetId]));
+    } catch { /* silently fail */ }
+  }, [userId]);
+
+  const unblockUser = useCallback(async (targetId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('blocked_users').delete().eq('blocker_id', userId).eq('blocked_id', targetId);
+      setBlockedIds(prev => { const next = new Set(prev); next.delete(targetId); return next; });
+    } catch { /* silently fail */ }
+  }, [userId]);
+
+  const reportUser = useCallback(async (targetId: string, reason: string, details?: string) => {
+    if (!userId) return false;
+    const supabase = createClient();
+    try {
+      const { error } = await supabase.from('reports').insert({
+        reporter_id: userId, reported_id: targetId, reason, details: details ?? null,
+      });
+      return !error;
+    } catch { return false; }
+  }, [userId]);
+
+  return { blockedIds, blockUser, unblockUser, reportUser, isBlocked: (id: string) => blockedIds.has(id) };
+}
+
+export function useMutedConversations(userId: string | undefined) {
+  const [mutedIds, setMutedIds] = useState<Set<string>>(new Set());
+
+  const fetchMuted = useCallback(async () => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      const { data } = await supabase.from('muted_conversations').select('conversation_id').eq('user_id', userId);
+      setMutedIds(new Set(data?.map(r => r.conversation_id) ?? []));
+    } catch { /* table may not exist */ }
+  }, [userId]);
+
+  useEffect(() => { fetchMuted(); }, [fetchMuted]);
+
+  const muteConversation = useCallback(async (conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('muted_conversations').insert({ user_id: userId, conversation_id: conversationId });
+      setMutedIds(prev => new Set([...prev, conversationId]));
+    } catch { /* silently fail */ }
+  }, [userId]);
+
+  const unmuteConversation = useCallback(async (conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('muted_conversations').delete().eq('user_id', userId).eq('conversation_id', conversationId);
+      setMutedIds(prev => { const next = new Set(prev); next.delete(conversationId); return next; });
+    } catch { /* silently fail */ }
+  }, [userId]);
+
+  return {
+    mutedIds,
+    muteConversation,
+    unmuteConversation,
+    isMuted: (id: string) => mutedIds.has(id),
+  };
+}
+
+export function useStarredMessages(userId: string | undefined) {
+  const [starredIds, setStarredIds] = useState<Set<string>>(new Set());
+
+  const fetchStarred = useCallback(async () => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      const { data } = await supabase
+        .from('starred_messages')
+        .select('message_id')
+        .eq('user_id', userId);
+      setStarredIds(new Set(data?.map(r => r.message_id) ?? []));
+    } catch { /* table may not exist */ }
+  }, [userId]);
+
+  useEffect(() => { fetchStarred(); }, [fetchStarred]);
+
+  const starMessage = useCallback(async (messageId: string, conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('starred_messages').insert({
+        user_id: userId, message_id: messageId, conversation_id: conversationId,
+      });
+      setStarredIds(prev => new Set([...prev, messageId]));
+    } catch { }
+  }, [userId]);
+
+  const unstarMessage = useCallback(async (messageId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('starred_messages').delete()
+        .eq('user_id', userId).eq('message_id', messageId);
+      setStarredIds(prev => { const n = new Set(prev); n.delete(messageId); return n; });
+    } catch { }
+  }, [userId]);
+
+  return { starredIds, starMessage, unstarMessage };
+}
+
+export function useArchivedConversations(userId: string | undefined) {
+  const [archivedIds, setArchivedIds] = useState<Set<string>>(new Set());
+
+  const fetchArchived = useCallback(async () => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      const { data } = await supabase
+        .from('archived_conversations')
+        .select('conversation_id')
+        .eq('user_id', userId);
+      setArchivedIds(new Set(data?.map(r => r.conversation_id) ?? []));
+    } catch { /* table may not exist */ }
+  }, [userId]);
+
+  useEffect(() => { fetchArchived(); }, [fetchArchived]);
+
+  const archiveConversation = useCallback(async (conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('archived_conversations').insert({ user_id: userId, conversation_id: conversationId });
+      setArchivedIds(prev => new Set([...prev, conversationId]));
+    } catch { }
+  }, [userId]);
+
+  const unarchiveConversation = useCallback(async (conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('archived_conversations').delete()
+        .eq('user_id', userId).eq('conversation_id', conversationId);
+      setArchivedIds(prev => { const n = new Set(prev); n.delete(conversationId); return n; });
+    } catch { }
+  }, [userId]);
+
+  return { archivedIds, archiveConversation, unarchiveConversation };
+}
+
+export function useChatFolders(userId: string | undefined) {
+  const [folders, setFolders] = useState<ChatFolder[]>([]);
+
+  const fetchFolders = useCallback(async () => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      const { data: folderRows } = await supabase
+        .from('chat_folders').select('*').eq('user_id', userId).order('position');
+      if (!folderRows?.length) { setFolders([]); return; }
+
+      const { data: fcRows } = await supabase
+        .from('folder_conversations').select('folder_id, conversation_id').eq('user_id', userId);
+
+      const fcMap = new Map<string, Set<string>>();
+      fcRows?.forEach(fc => {
+        if (!fcMap.has(fc.folder_id)) fcMap.set(fc.folder_id, new Set());
+        fcMap.get(fc.folder_id)!.add(fc.conversation_id);
+      });
+
+      setFolders(folderRows.map(f => ({ ...f, conversationIds: fcMap.get(f.id) ?? new Set() })));
+    } catch { /* tables may not exist */ }
+  }, [userId]);
+
+  useEffect(() => { fetchFolders(); }, [fetchFolders]);
+
+  const createFolder = useCallback(async (name: string, emoji?: string, color?: string): Promise<string | null> => {
+    if (!userId) return null;
+    const supabase = createClient();
+    try {
+      const { data, error } = await supabase.from('chat_folders').insert({
+        user_id: userId, name, emoji: emoji ?? null,
+        color: color ?? '#6366f1', position: folders.length,
+      }).select().single();
+      if (!error && data) {
+        setFolders(prev => [...prev, { ...data, conversationIds: new Set() }]);
+        return data.id as string;
+      }
+    } catch { }
+    return null;
+  }, [userId, folders.length]);
+
+  const deleteFolder = useCallback(async (folderId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('chat_folders').delete().eq('id', folderId).eq('user_id', userId);
+      setFolders(prev => prev.filter(f => f.id !== folderId));
+    } catch { }
+  }, [userId]);
+
+  const addToFolder = useCallback(async (folderId: string, conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('folder_conversations').insert({
+        folder_id: folderId, conversation_id: conversationId, user_id: userId,
+      });
+      setFolders(prev => prev.map(f =>
+        f.id === folderId
+          ? { ...f, conversationIds: new Set([...f.conversationIds, conversationId]) }
+          : f
+      ));
+    } catch { }
+  }, [userId]);
+
+  const removeFromFolder = useCallback(async (folderId: string, conversationId: string) => {
+    if (!userId) return;
+    const supabase = createClient();
+    try {
+      await supabase.from('folder_conversations').delete()
+        .eq('folder_id', folderId).eq('conversation_id', conversationId).eq('user_id', userId);
+      setFolders(prev => prev.map(f => {
+        if (f.id !== folderId) return f;
+        const n = new Set(f.conversationIds); n.delete(conversationId);
+        return { ...f, conversationIds: n };
+      }));
+    } catch { }
+  }, [userId]);
+
+  return { folders, createFolder, deleteFolder, addToFolder, removeFromFolder };
+}
+
+export function usePushNotifications(userId: string | undefined) {
+  const [permission, setPermission] = useState<NotificationPermission>('default');
+  const [subscribed, setSubscribed] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    setPermission(Notification.permission);
+  }, []);
+
+  const requestPermission = useCallback(async (): Promise<boolean> => {
+    if (!('Notification' in window)) return false;
+    const perm = await Notification.requestPermission();
+    setPermission(perm);
+    return perm === 'granted';
+  }, []);
+
+  const subscribeToPush = useCallback(async () => {
+    if (!userId || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+
+      const vapidKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+      if (!vapidKey) {
+        console.warn('NEXT_PUBLIC_VAPID_PUBLIC_KEY not set — push disabled');
+        return;
+      }
+
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: vapidKey,
+      });
+
+      const { keys } = sub.toJSON() as { keys?: { p256dh?: string; auth?: string } };
+      const supabase = createClient();
+      await supabase.from('push_subscriptions').upsert({
+        user_id: userId,
+        endpoint: sub.endpoint,
+        p256dh: keys?.p256dh ?? '',
+        auth: keys?.auth ?? '',
+        user_agent: navigator.userAgent.slice(0, 200),
+      });
+      setSubscribed(true);
+    } catch (err) {
+      console.error('Push subscription error:', err);
+    }
+  }, [userId]);
+
+  const showLocalNotification = useCallback((title: string, body: string, tag?: string) => {
+    if (permission !== 'granted') return;
+    if (document.visibilityState === 'visible') return;
+    try {
+      new Notification(title, { body, tag: tag ?? 'lumi', icon: '/apple-icon.png' });
+    } catch { }
+  }, [permission]);
+
+  return { permission, subscribed, requestPermission, subscribeToPush, showLocalNotification };
+}
+
+export function useE2EEncryption(
+  conversationId: string | null,
+  userId: string | undefined,
+  otherUserId?: string | null
+) {
+  const [isEnabled, setIsEnabled] = useState(false);
+  const [myKeys, setMyKeys] = useState<{ publicKeyStr: string; privateKeyStr: string } | null>(null);
+  const [otherPublicKey, setOtherPublicKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    setIsEnabled(localStorage.getItem(`lumi_e2e:${conversationId}`) === 'true');
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (!userId) return;
+    getOrCreateKeyPair().then(async (keys) => {
+      setMyKeys(keys);
+      const supabase = createClient();
+      await supabase.from('profiles').update({ public_key: keys.publicKeyStr }).eq('id', userId);
+    });
+  }, [userId]);
+
+  useEffect(() => {
+    if (!otherUserId) { setOtherPublicKey(null); return; }
+    const supabase = createClient();
+    supabase.from('profiles').select('public_key').eq('id', otherUserId).single()
+      .then(({ data }) => setOtherPublicKey(data?.public_key ?? null));
+  }, [otherUserId]);
+
+  const toggleEncryption = useCallback(() => {
+    if (!conversationId) return;
+    const next = !isEnabled;
+    setIsEnabled(next);
+    localStorage.setItem(`lumi_e2e:${conversationId}`, next.toString());
+  }, [conversationId, isEnabled]);
+
+  const encrypt = useCallback(async (text: string): Promise<string> => {
+    if (!isEnabled || !myKeys || !otherPublicKey) return text;
+    try { return await encryptText(text, myKeys.privateKeyStr, otherPublicKey); } catch { return text; }
+  }, [isEnabled, myKeys, otherPublicKey]);
+
+  const decrypt = useCallback(async (text: string, senderPubKey?: string | null): Promise<string> => {
+    if (!myKeys) return text;
+    const pubKey = senderPubKey ?? otherPublicKey;
+    if (!pubKey || !isEncryptedPayload(text)) return text;
+    try { return await decryptText(text, myKeys.privateKeyStr, pubKey); } catch { return text; }
+  }, [myKeys, otherPublicKey]);
+
+  return {
+    isEnabled,
+    toggleEncryption,
+    encrypt,
+    decrypt,
+    canEncrypt: !!(myKeys && otherPublicKey),
+    myPublicKey: myKeys?.publicKeyStr ?? null,
+  };
+}
+
+export const DISAPPEAR_OPTIONS = [
+  { label: 'Off', seconds: null },
+  { label: '1 hour', seconds: 3600 },
+  { label: '24 hours', seconds: 86400 },
+  { label: '7 days', seconds: 604800 },
+  { label: '30 days', seconds: 2592000 },
+] as const;
+
+export function useDisappearingMessages(conversationId: string | null) {
+  const [disappearAfter, setDisappearAfterState] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!conversationId) { setDisappearAfterState(null); return; }
+    const supabase = createClient();
+    supabase
+      .from('conversations')
+      .select('disappear_after')
+      .eq('id', conversationId)
+      .single()
+      .then(({ data }) => setDisappearAfterState(data?.disappear_after ?? null));
+  }, [conversationId]);
+
+  const setDisappearAfter = useCallback(async (seconds: number | null) => {
+    if (!conversationId) return;
+    const supabase = createClient();
+    await supabase
+      .from('conversations')
+      .update({ disappear_after: seconds })
+      .eq('id', conversationId);
+    setDisappearAfterState(seconds);
+  }, [conversationId]);
+
+  const getExpiresAt = useCallback((): string | null => {
+    if (!disappearAfter) return null;
+    return new Date(Date.now() + disappearAfter * 1000).toISOString();
+  }, [disappearAfter]);
+
+  return { disappearAfter, setDisappearAfter, getExpiresAt };
 }

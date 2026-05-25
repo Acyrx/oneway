@@ -14,7 +14,20 @@ import {
   useMessages,
   useSendMessage,
   useSendGif,
-  useOnlinePresence,
+  usePresenceWithStatus,
+  useTypingIndicator,
+  useEditMessage,
+  usePinnedMessages,
+  useFileUpload,
+  useSendVoiceNote,
+  useBlockedUsers,
+  useMutedConversations,
+  useE2EEncryption,
+  useArchivedConversations,
+  useChatFolders,
+  usePushNotifications,
+  useStarredMessages,
+  useDisappearingMessages,
 } from "@/hooks/use-chat";
 import { createClient } from "@/lib/supabase/client";
 import CreatePollModal from "../CreatePollModal";
@@ -22,6 +35,7 @@ import CreateTaskModal from "../CreateTaskModal";
 import CreateCalendarEventModal from "../CreateCalendarEventModal";
 import CreateReminderModal from "../CreateReminderModal";
 import { GroupInfoPanel } from "./group-info-panel";
+import { ThreadPanel } from "./thread-panel";
 import {
   getMemberProfiles,
   isGroupConversation,
@@ -34,6 +48,7 @@ import type {
   CalendarEvent,
   Reminder,
 } from "@/lib/types";
+import { isEncryptedPayload } from "@/lib/encryption";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -48,11 +63,12 @@ interface ProductivityModal {
 
 export function ChatView() {
   const router = useRouter();
-  const { user, loading: userLoading } = useUser();
+  const { user, profile, loading: userLoading } = useUser();
   const {
     conversations,
     loading: convsLoading,
     refetch,
+    markConversationRead,
   } = useConversations(user?.id);
 
   const [selectedConversationId, setSelectedConversationId] = useState<
@@ -66,23 +82,56 @@ export function ChatView() {
   } = useMessages(selectedConversationId, user?.id);
   const { sendMessage, sending } = useSendMessage();
   const { sendGif } = useSendGif();
-  const onlineUserIds = useOnlinePresence(user?.id);
+  const { presenceMap, myStatus, updateStatus } = usePresenceWithStatus(user?.id);
+  const { editMessage } = useEditMessage();
+  const { pinnedMessages, pinMessage, unpinMessage } = usePinnedMessages(selectedConversationId);
+  const { uploadFile } = useFileUpload();
+  const { sendVoiceNote } = useSendVoiceNote();
+  const { blockedIds, blockUser, unblockUser, reportUser } = useBlockedUsers(user?.id);
+  const { mutedIds, muteConversation, unmuteConversation } = useMutedConversations(user?.id);
+  const { archivedIds, archiveConversation, unarchiveConversation } = useArchivedConversations(user?.id);
+  const { folders, createFolder, deleteFolder, addToFolder } = useChatFolders(user?.id);
+  const { permission, requestPermission, subscribeToPush, showLocalNotification } = usePushNotifications(user?.id);
+  const { starredIds, starMessage, unstarMessage } = useStarredMessages(user?.id);
+  const { disappearAfter, setDisappearAfter, getExpiresAt } = useDisappearingMessages(selectedConversationId);
+
+  // Typing indicator for the selected conversation
+  const { typingUsers, sendTyping } = useTypingIndicator(
+    selectedConversationId,
+    user?.id,
+    profile?.display_name
+  );
+
+  // Build typing label shown in header / input
+  const typingLabel = (() => {
+    if (!typingUsers.size) return null;
+    const names = [...typingUsers.values()];
+    if (names.length === 1) return `${names[0]} is typing...`;
+    if (names.length === 2) return `${names[0]} and ${names[1]} are typing...`;
+    return "Several people are typing...";
+  })();
 
   // ── Enriched data with real-time presence ──────────────────────────────────
   const enrichedConversations = conversations.map((conv) => {
-    const members = conv.members?.map((m) => ({
-      ...m,
-      profile: {
-        ...m.profile,
-        is_online: onlineUserIds.has(m.user_id),
-      },
-    }));
+    const members = conv.members?.map((m) => {
+      const pInfo = presenceMap.get(m.user_id);
+      return {
+        ...m,
+        profile: {
+          ...m.profile,
+          is_online: !!pInfo?.isOnline,
+          presence_status: pInfo?.status ?? 'online',
+        },
+      };
+    });
 
     let other_user = conv.other_user;
     if (other_user) {
+      const pInfo = presenceMap.get(other_user.id);
       other_user = {
         ...other_user,
-        is_online: onlineUserIds.has(other_user.id),
+        is_online: !!pInfo?.isOnline,
+        presence_status: pInfo?.status ?? 'online',
       };
     }
 
@@ -93,11 +142,20 @@ export function ChatView() {
     (c) => c.id === selectedConversationId
   );
 
+  const otherUserId = selectedConversation?.other_user?.id ?? null;
+  const { isEnabled: isEncrypted, toggleEncryption, encrypt, decrypt, canEncrypt } = useE2EEncryption(
+    selectedConversationId,
+    user?.id,
+    otherUserId
+  );
+
   // ── UI state ───────────────────────────────────────────────────────────────
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [productivityModal, setProductivityModal] =
     useState<ProductivityModal | null>(null);
   const [showGroupInfo, setShowGroupInfo] = useState(false);
+  const [openThreadMessageId, setOpenThreadMessageId] = useState<string | null>(null);
+  const [mentionedConvIds, setMentionedConvIds] = useState<Set<string>>(new Set());
 
   // ── Productivity data keyed by message.id ─────────────────────────────────
   const [polls, setPolls] = useState<Record<string, Poll>>({});
@@ -106,6 +164,112 @@ export function ChatView() {
     Record<string, CalendarEvent>
   >({});
   const [reminders, setReminders] = useState<Record<string, Reminder>>({});
+  const [decryptedTexts, setDecryptedTexts] = useState<Record<string, string>>({});
+
+  // ── Browser Notifications ──────────────────────────────────────────────────
+  useEffect(() => {
+    const totalUnread = enrichedConversations.reduce(
+      (acc, conv) => acc + (conv.unread_count || 0),
+      0
+    );
+
+    if (totalUnread > 0) {
+      document.title = `(${totalUnread}) Messages`;
+    } else {
+      document.title = "Messages";
+    }
+
+    const lastUnread = parseInt(sessionStorage.getItem("lastUnreadCount") || "0");
+    if (totalUnread > lastUnread && selectedConversationId && !mutedIds.has(selectedConversationId)) {
+      try {
+        const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+        const gain = ctx.createGain();
+        gain.connect(ctx.destination);
+        const osc = ctx.createOscillator();
+        osc.connect(gain);
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(1046, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(784, ctx.currentTime + 0.08);
+        gain.gain.setValueAtTime(0.35, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.28);
+        osc.onended = () => ctx.close();
+      } catch (_e) {}
+    }
+    sessionStorage.setItem("lastUnreadCount", totalUnread.toString());
+  }, [enrichedConversations, mutedIds, selectedConversationId]);
+
+  // ── Decrypt encrypted messages ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!messages.length) return;
+    const encrypted = messages.filter(m => isEncryptedPayload(m.text));
+    if (!encrypted.length) return;
+
+    encrypted.forEach(async (m) => {
+      const senderPubKey = m.sender_id === user?.id
+        ? null
+        : selectedConversation?.other_user?.public_key ?? null;
+      const plain = await decrypt(m.text, senderPubKey);
+      setDecryptedTexts(prev => {
+        if (prev[m.id] === plain) return prev;
+        return { ...prev, [m.id]: plain };
+      });
+    });
+  }, [messages, decrypt, user?.id, selectedConversation?.other_user?.public_key]);
+
+  // ── Push notifications — request permission on first load ──────────────────
+  useEffect(() => {
+    if (!user || permission !== 'default') return;
+    const asked = sessionStorage.getItem('push_asked');
+    if (asked) return;
+    sessionStorage.setItem('push_asked', '1');
+    requestPermission().then(granted => {
+      if (granted) subscribeToPush();
+    });
+  }, [user, permission, requestPermission, subscribeToPush]);
+
+  // ── Mention detection — track which conversations mention current user ──────
+  useEffect(() => {
+    if (!profile || !messages.length || !selectedConversationId) return;
+    const myName = profile.display_name.toLowerCase();
+    const hasMention = messages.some(m =>
+      m.sender_id !== user?.id && m.text?.toLowerCase().includes(`@${myName}`)
+    );
+    if (hasMention) {
+      setMentionedConvIds(prev => new Set([...prev, selectedConversationId]));
+    }
+  }, [messages, profile, user?.id, selectedConversationId]);
+
+  // Clear mention badge when user opens the conversation
+  useEffect(() => {
+    if (selectedConversationId) {
+      setMentionedConvIds(prev => {
+        if (!prev.has(selectedConversationId)) return prev;
+        const n = new Set(prev); n.delete(selectedConversationId); return n;
+      });
+    }
+  }, [selectedConversationId]);
+
+  // Keep unread count at 0 while this conversation is open
+  useEffect(() => {
+    if (selectedConversationId && messages.length > 0) {
+      markConversationRead(selectedConversationId);
+    }
+  }, [messages, selectedConversationId, markConversationRead]);
+
+  // ── Show notification for new messages in other conversations ───────────────
+  useEffect(() => {
+    if (!profile) return;
+    conversations.forEach(conv => {
+      if (conv.id === selectedConversationId) return;
+      if (mutedIds.has(conv.id)) return;
+      if ((conv.unread_count ?? 0) === 0) return;
+      const senderName = conv.other_user?.display_name ?? conv.name ?? 'Someone';
+      const preview = conv.last_message?.text?.slice(0, 50) ?? 'New message';
+      showLocalNotification(senderName, preview, conv.id);
+    });
+  }, [conversations]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auth redirect ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -322,7 +486,7 @@ export function ChatView() {
           if (reminder.message_id) {
             setReminders((prev) => ({
               ...prev,
-              [reminder.message_id]: reminder,
+              [reminder.message_id!]: reminder,
             }));
           }
         }
@@ -340,7 +504,7 @@ export function ChatView() {
           if (reminder.message_id) {
             setReminders((prev) => ({
               ...prev,
-              [reminder.message_id]: reminder,
+              [reminder.message_id!]: reminder,
             }));
           }
         }
@@ -369,8 +533,16 @@ export function ChatView() {
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleSelectConversation = (id: string) => {
     setSelectedConversationId(id);
+    markConversationRead(id);
     setReplyingTo(null);
     setShowGroupInfo(false);
+    setOpenThreadMessageId(null);
+  };
+
+  const handleSendThreadReply = async (text: string, replyToId: string) => {
+    if (!selectedConversationId || !user) return;
+    await sendMessage(selectedConversationId, user.id, text, replyToId);
+    refetch();
   };
 
   const handleBackToList = () => {
@@ -381,19 +553,33 @@ export function ChatView() {
 
   const handleSendMessage = async (text: string) => {
     if (!selectedConversationId || !user) return;
+    const payload = await encrypt(text);
     await sendMessage(
       selectedConversationId,
       user.id,
-      text,
-      replyingTo?.id ?? null
+      payload,
+      replyingTo?.id ?? null,
+      getExpiresAt()
     );
     setReplyingTo(null);
     refetch();
   };
 
+  const handleSendFile = async (file: File) => {
+    if (!selectedConversationId || !user) return;
+    await uploadFile(selectedConversationId, user.id, file, getExpiresAt());
+    refetch();
+  };
+
+  const handleSendVoiceNote = async (blob: Blob, duration: number) => {
+    if (!selectedConversationId || !user) return;
+    await sendVoiceNote(selectedConversationId, user.id, blob, duration, getExpiresAt());
+    refetch();
+  };
+
   const handleSendGif = async (gifUrl: string) => {
     if (!selectedConversationId || !user) return;
-    await sendGif(selectedConversationId, user.id, gifUrl);
+    await sendGif(selectedConversationId, user.id, gifUrl, getExpiresAt());
     refetch();
   };
 
@@ -407,8 +593,45 @@ export function ChatView() {
     if (error) console.error("Error deleting message:", error);
   };
 
+  const handleEditMessage = async (messageId: string, newText: string): Promise<boolean> => {
+    return editMessage(messageId, newText);
+  };
+
+  const handlePinMessage = async (message: Message) => {
+    if (!user) return;
+    await pinMessage(message, user.id);
+  };
+
+  const handleUnpinMessage = async (messageId: string) => {
+    await unpinMessage(messageId);
+  };
+
+  const handleForwardMessage = async (message: Message, targetConversationId: string) => {
+    if (!user) return;
+    const supabase = createClient();
+    const text = message.message_type === "gif"
+      ? "GIF"
+      : message.message_type === "poll" ? "📊 Poll"
+      : message.message_type === "task" ? "✅ Task"
+      : message.message_type === "calendar_event" ? "📅 Event"
+      : message.message_type === "reminder" ? "⏰ Reminder"
+      : message.text ?? "";
+    await supabase.from("messages").insert({
+      conversation_id: targetConversationId,
+      sender_id: user.id,
+      text,
+      message_type: "text",
+      status: "sent",
+    });
+    await supabase
+      .from("conversations")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", targetConversationId);
+    refetch();
+  };
+
   const handleOpenThread = (message: Message) => {
-    console.log("Open thread for:", message.id);
+    setOpenThreadMessageId(message.id);
   };
 
   // Creates the placeholder message then opens the matching modal
@@ -531,7 +754,7 @@ export function ChatView() {
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div className="flex h-screen bg-background">
+    <div className="flex h-[100dvh] bg-background overflow-hidden">
       {/* Conversation List */}
       <aside
         className={cn(
@@ -545,7 +768,17 @@ export function ChatView() {
           onSelect={handleSelectConversation}
           isLoading={convsLoading}
           currentUserId={user.id}
+          currentUserProfile={profile}
           onConversationCreated={refetch}
+          myStatus={myStatus}
+          onStatusChange={updateStatus}
+          mutedConversationIds={mutedIds}
+          archivedConversationIds={archivedIds}
+          mentionedConversationIds={mentionedConvIds}
+          folders={folders}
+          onCreateFolder={createFolder}
+          onDeleteFolder={deleteFolder}
+          onAddToFolder={addToFolder}
         />
       </aside>
 
@@ -564,7 +797,40 @@ export function ChatView() {
               onBack={handleBackToList}
               showBackButton={true}
               onOpenGroupInfo={() => setShowGroupInfo(true)}
+              presenceStatus={otherUser ? (presenceMap.get(otherUser.id)?.status ?? undefined) : undefined}
+              typingLabel={typingLabel}
+              disappearAfter={disappearAfter}
+              onSetDisappearAfter={!isGroup ? setDisappearAfter : undefined}
+              isMuted={selectedConversationId ? mutedIds.has(selectedConversationId) : false}
+              onToggleMute={selectedConversationId ? () => {
+                if (mutedIds.has(selectedConversationId)) {
+                  unmuteConversation(selectedConversationId);
+                } else {
+                  muteConversation(selectedConversationId);
+                }
+              } : undefined}
+              isBlocked={otherUser ? blockedIds.has(otherUser.id) : false}
+              onToggleBlock={otherUser ? () => {
+                if (blockedIds.has(otherUser.id)) {
+                  unblockUser(otherUser.id);
+                } else {
+                  blockUser(otherUser.id);
+                }
+              } : undefined}
+              onReport={otherUser ? () => reportUser(otherUser.id, 'inappropriate_content') : undefined}
+              isEncrypted={isEncrypted}
+              canEncrypt={canEncrypt}
+              isArchived={selectedConversationId ? archivedIds.has(selectedConversationId) : false}
+              onToggleArchive={selectedConversationId ? () => {
+                if (archivedIds.has(selectedConversationId)) {
+                  unarchiveConversation(selectedConversationId);
+                } else {
+                  archiveConversation(selectedConversationId);
+                }
+              } : undefined}
+              onToggleEncryption={toggleEncryption}
             />
+            <div className="flex flex-1 overflow-hidden">
             <MessageThread
               messages={messages}
               currentUserId={user.id}
@@ -579,16 +845,42 @@ export function ChatView() {
               calendarEvents={calendarEvents}
               reminders={reminders}
               participants={participants}
+              pinnedMessages={pinnedMessages}
+              conversations={enrichedConversations.filter(c => c.id !== selectedConversationId)}
+              blockedUserIds={blockedIds}
+              decryptedTexts={decryptedTexts}
+              isEncrypted={isEncrypted}
               onDeleteMessage={handleDeleteMessage}
               onReplyTo={setReplyingTo}
               onOpenThread={handleOpenThread}
+              onEditMessage={handleEditMessage}
+              onPinMessage={handlePinMessage}
+              onUnpinMessage={handleUnpinMessage}
+              onForwardMessage={handleForwardMessage}
+              starredMessageIds={starredIds}
+              onStarMessage={(msg) => starMessage(msg.id, msg.conversation_id)}
+              onUnstarMessage={unstarMessage}
             />
+            {openThreadMessageId && (
+              <ThreadPanel
+                rootMessageId={openThreadMessageId}
+                allMessages={messages}
+                memberProfiles={selectedConversation.members?.map(m => m.profile) ?? []}
+                currentUserId={user.id}
+                otherUser={otherUser}
+                onClose={() => setOpenThreadMessageId(null)}
+                onSendReply={handleSendThreadReply}
+              />
+            )}
+            </div>
             <MessageInput
               onSend={handleSendMessage}
               isSending={sending}
               onSendGif={handleSendGif}
               replyingTo={replyingTo}
               onCancelReply={() => setReplyingTo(null)}
+              onTyping={sendTyping}
+              typingLabel={typingLabel ?? undefined}
               currentUserId={user.id}
               otherUser={otherUser}
               memberProfiles={
@@ -596,6 +888,8 @@ export function ChatView() {
               }
               isGroup={isGroup}
               onCreateProductivity={handleCreateProductivity}
+              onSendFile={handleSendFile}
+              onSendVoiceNote={handleSendVoiceNote}
             />
             {showGroupInfo && isGroup && (
               <GroupInfoPanel
